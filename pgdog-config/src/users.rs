@@ -652,8 +652,8 @@ mod tests {
     fn test_requires_password_exempts_sts_users() {
         let config = Config::default();
         let mut user = User {
-            name: "issues_service".into(),
-            database: "pool".into(),
+            name: "app_service".into(),
+            database: "app_db".into(),
             ..Default::default()
         };
         assert!(user.requires_password(&config));
