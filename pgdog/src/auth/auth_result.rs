@@ -26,6 +26,9 @@ pub(crate) enum AuthResult {
     /// STS token verification failed (malformed, rejected by STS, or the
     /// caller identity isn't in `allowed_iam_arns`).
     NoStsToken,
+    /// STS verification capacity stayed exhausted for the whole bounded
+    /// wait; the credential was never judged.
+    StsVerificationOverloaded,
 }
 
 impl AuthResult {
@@ -49,6 +52,7 @@ impl AuthResult {
             Self::NoUserOrDatabase => "no_user_or_database",
             Self::NoPasswordMessage => "no_password_message",
             Self::NoStsToken => "sts_token_rejected",
+            Self::StsVerificationOverloaded => "sts_verification_overloaded",
         }
     }
 }
@@ -82,6 +86,9 @@ impl Display for AuthResult {
             Self::NoUserOrDatabase => write!(f, "no user or database in config"),
             Self::NoPasswordMessage => write!(f, "client did not send password message"),
             Self::NoStsToken => write!(f, "STS token verification failed"),
+            Self::StsVerificationOverloaded => {
+                write!(f, "STS verification capacity exhausted")
+            }
         }
     }
 }
@@ -99,6 +106,15 @@ mod tests {
         // in wrong passwords, even though both look identical to clients.
         assert_eq!(result.reason(), "sts_token_rejected");
         assert_ne!(result.reason(), AuthResult::NoPasswordMatch.reason());
+    }
+
+    #[test]
+    fn sts_overload_is_an_error_with_its_own_metric_reason() {
+        let result = AuthResult::StsVerificationOverloaded;
+
+        assert!(!result.is_ok());
+        assert_eq!(result.reason(), "sts_verification_overloaded");
+        assert_ne!(result.reason(), AuthResult::NoStsToken.reason());
     }
 
     #[test]
