@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::core::Config;
 use super::pooling::PoolerMode;
@@ -50,6 +50,15 @@ impl Users {
     /// Run configuration checks.
     pub fn check(&mut self, config: &Config) {
         for user in &mut self.users {
+            if !user.allowed_iam_arns.is_empty() {
+                info!(
+                    r#"user "{}" (database "{}") uses STS client auth ({} allowed IAM ARNs)"#,
+                    user.name,
+                    user.database,
+                    user.allowed_iam_arns.len(),
+                );
+            }
+
             if user.passwords().is_empty() {
                 if user.requires_password(config) {
                     warn!(
@@ -350,6 +359,20 @@ pub struct User {
     /// current password from Vault and compares it to what the client
     /// provides instead of using a statically configured password.
     pub vault_path: Option<String>,
+    /// IAM role ARNs allowed to authenticate as this user via AWS STS client
+    /// authentication. Clients present a presigned STS GetCallerIdentity URL as
+    /// their password; the caller's role ARN must match one of these entries.
+    /// Entries must be the path-less role ARN exactly as it appears in
+    /// assumed-role ARNs (`arn:aws:iam::<account>:role/<Name>`); a
+    /// path-qualified entry (`role/some/path/<Name>`) can never match because
+    /// STS drops the path from assumed-role ARNs.
+    ///
+    /// **Note:** Requires `sts_server_id` to be set in the `[general]` section
+    /// of `pgdog.toml`.
+    ///
+    /// _Default:_ `[]` (STS client authentication disabled for this user)
+    #[serde(default)]
+    pub allowed_iam_arns: Vec<String>,
     /// Statement timeout.
     ///
     /// Sets the `statement_timeout` on all server connections at connection creation. This allows you to set a reasonable default for each user without modifying `postgresql.conf` or using `ALTER USER`.
@@ -433,6 +456,7 @@ impl User {
                 .auth_type
                 .unwrap_or(config.general.auth_type)
                 .external_token()
+            && self.allowed_iam_arns.is_empty()
     }
 
     fn password(&self) -> &str {
@@ -622,6 +646,21 @@ mod tests {
             .find(|u| u.name == "bob" && u.database == "source_db")
             .unwrap();
         assert_eq!(bob_source.password(), "pass4");
+    }
+
+    #[test]
+    fn test_requires_password_exempts_sts_users() {
+        let config = Config::default();
+        let mut user = User {
+            name: "issues_service".into(),
+            database: "pool".into(),
+            ..Default::default()
+        };
+        assert!(user.requires_password(&config));
+
+        // An STS-only user is fully configured and must not be warned about.
+        user.allowed_iam_arns = vec!["arn:aws:iam::123456789012:role/app-service-role".into()];
+        assert!(!user.requires_password(&config));
     }
 
     #[test]

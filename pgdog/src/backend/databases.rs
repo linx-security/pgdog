@@ -424,6 +424,7 @@ impl Databases {
             if cluster.passwords().is_empty()
                 && cluster.identity().is_none()
                 && !cluster.auth_type().external_token()
+                && cluster.allowed_iam_arns().is_empty()
             {
                 warn!(
                     r#"disabling pool for user "{}" and database "{}", password not set"#,
