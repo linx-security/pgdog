@@ -110,6 +110,16 @@ impl Router {
         }
     }
 
+    /// Forget the shard the transaction was pinned to.
+    ///
+    /// A pin lives for one transaction. `reset` only runs once a server
+    /// connection is released, so a transaction that ends without one (e.g. its
+    /// only statement was `SET LOCAL pgdog.sharding_key`) must drop the pin
+    /// here, or the next transaction inherits it.
+    pub(crate) fn unpin(&mut self) {
+        self.pinned_shard = None;
+    }
+
     /// Reset query routing state.
     pub(crate) fn reset(&mut self) {
         self.query_parser = QueryParser::default();

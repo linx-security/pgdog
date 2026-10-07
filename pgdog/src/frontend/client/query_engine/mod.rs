@@ -244,8 +244,11 @@ impl QueryEngine {
                         .await?
                 }
 
-                if client_request.is_executable() && context.params.commit() {
-                    self.comms.update_params(context.params);
+                if client_request.is_executable() {
+                    self.router.unpin();
+                    if context.params.commit() {
+                        self.comms.update_params(context.params);
+                    }
                 }
             }
             Command::RollbackTransaction { extended, .. } => {
@@ -260,6 +263,7 @@ impl QueryEngine {
                 }
 
                 if client_request.is_executable() {
+                    self.router.unpin();
                     context.params.rollback();
                 }
             }
