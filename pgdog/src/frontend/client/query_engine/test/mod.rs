@@ -37,6 +37,7 @@ mod regression_prepare_transaction_end;
 mod regression_prepare_transaction_end_idle;
 mod regression_prepare_transaction_end_params;
 mod regression_replica_only_transaction;
+mod regression_set_local_pin_transaction_end;
 mod regression_shard_directed_rollback;
 mod replicas;
 mod rewrite_extended;
