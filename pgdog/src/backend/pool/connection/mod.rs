@@ -219,6 +219,12 @@ impl Connection {
         // inside a transaction decide if it's a read or a write; we haven't
         // connected to Postgres yet, so we can still make this call.
         let is_read = is_read.unwrap_or(route.is_read());
+        // Pools count the checkout as a read or a write, so it must match the
+        // routing decision, not the route of the statement that triggered it.
+        let request = &Request {
+            read: is_read,
+            ..*request
+        };
 
         if let Shard::Direct(shard) = route.shard() {
             let server = match self.cluster.get_conn(request, *shard, is_read).await {
