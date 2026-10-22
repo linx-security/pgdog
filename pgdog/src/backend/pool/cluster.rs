@@ -2,6 +2,7 @@
 
 use futures::future::try_join_all;
 use parking_lot::Mutex;
+use pgdog_config::AuthType;
 use pgdog_config::{
     LoadSchema, PreparedStatementsLevel, QueryParser, QueryParserLevel, Rewrite, RewriteMode,
     users::PasswordKind,
@@ -54,6 +55,7 @@ pub(crate) struct Cluster {
     identifier: Arc<DatabaseUser>,
     shards: Vec<Shard>,
     passwords: Vec<PasswordKind>,
+    allowed_iam_arns: Vec<String>,
     pooler_mode: PoolerMode,
     sharded_tables: ShardedTables,
     sharded_schemas: ShardedSchemas,
@@ -91,6 +93,7 @@ pub(crate) struct Cluster {
     read_only: bool,
     failover_signal: ClusterFailoverSignalWatcher,
     cancellation_token: CancellationToken,
+    auth_type: AuthType,
 }
 
 /// Bare test clusters carry the same defaults the config would apply,
@@ -105,6 +108,7 @@ impl Default for Cluster {
             identifier: Default::default(),
             shards: Default::default(),
             passwords: Default::default(),
+            allowed_iam_arns: Default::default(),
             pooler_mode: Default::default(),
             sharded_tables: Default::default(),
             sharded_schemas: Default::default(),
@@ -141,6 +145,7 @@ impl Default for Cluster {
             read_only: Default::default(),
             failover_signal: ClusterFailoverSignalWatcher::default(),
             cancellation_token: Default::default(),
+            auth_type: AuthType::default(),
         }
     }
 }
@@ -195,6 +200,7 @@ pub(crate) struct ClusterConfig<'a> {
     lb_strategy: LoadBalancingStrategy,
     user: &'a str,
     passwords: Vec<PasswordKind>,
+    allowed_iam_arns: &'a [String],
     pooler_mode: PoolerMode,
     sharded_tables: ShardedTables,
     multi_tenant: &'a Option<MultiTenant>,
@@ -229,6 +235,7 @@ pub(crate) struct ClusterConfig<'a> {
     schema_cache: SchemaCache,
     canonicalize_oids: bool,
     read_only: bool,
+    auth_type: AuthType,
 }
 
 impl<'a> ClusterConfig<'a> {
@@ -257,6 +264,7 @@ impl<'a> ClusterConfig<'a> {
         Self {
             name: &user.database,
             passwords: user.passwords(),
+            allowed_iam_arns: &user.allowed_iam_arns,
             user: &user.name,
             pooler_mode,
             lb_strategy: general.load_balancing_strategy,
@@ -299,6 +307,7 @@ impl<'a> ClusterConfig<'a> {
             schema_cache,
             canonicalize_oids: general.canonicalize_type_information,
             read_only: user.read_only.unwrap_or(false),
+            auth_type: user.auth_type.unwrap_or(general.auth_type),
         }
     }
 }
@@ -312,6 +321,7 @@ impl Cluster {
             lb_strategy,
             user,
             passwords,
+            allowed_iam_arns,
             pooler_mode,
             sharded_tables,
             multi_tenant,
@@ -346,6 +356,7 @@ impl Cluster {
             schema_cache,
             canonicalize_oids,
             read_only,
+            auth_type,
         } = config;
 
         let identifier = Arc::new(DatabaseUser {
@@ -383,6 +394,7 @@ impl Cluster {
             identifier: identifier.clone(),
             shards: shard_pools,
             passwords,
+            allowed_iam_arns: allowed_iam_arns.to_vec(),
             pooler_mode,
             sharded_tables,
             sharded_schemas,
@@ -421,6 +433,7 @@ impl Cluster {
             read_only,
             failover_signal,
             cancellation_token: Default::default(),
+            auth_type,
         }
     }
 
@@ -503,6 +516,12 @@ impl Cluster {
 
     pub(crate) fn passwords(&self) -> &[PasswordKind] {
         &self.passwords
+    }
+
+    /// IAM role ARNs allowed to authenticate as this user with a presigned
+    /// AWS STS token. Non-empty enables STS client authentication.
+    pub(crate) fn allowed_iam_arns(&self) -> &[String] {
+        &self.allowed_iam_arns
     }
 
     /// Get user identity which should match the TLS certificate it provided
@@ -730,6 +749,11 @@ impl Cluster {
     /// Base delay between replication-subscriber retry attempts.
     pub(crate) fn resharding_replication_retry_min_delay(&self) -> Duration {
         self.resharding_replication_retry_min_delay
+    }
+
+    /// Get auth algorithm used by clients to connect.
+    pub(crate) fn auth_type(&self) -> &AuthType {
+        &self.auth_type
     }
 
     /// Send a cancellation request for all running queries.
