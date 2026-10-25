@@ -34,7 +34,7 @@ async fn extended_set_local(client: &mut TestClient, name: &str, sharding_key: i
     client
         .send(Parse::named(
             name,
-            &format!("SET LOCAL pgdog.sharding_key TO '{sharding_key}'"),
+            format!("SET LOCAL pgdog.sharding_key TO '{sharding_key}'"),
         ))
         .await;
     client.send(Describe::new_statement(name)).await;

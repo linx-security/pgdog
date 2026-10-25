@@ -1,12 +1,13 @@
 use tracing::{info, trace};
 
 use crate::{
+    backend::Error as BackendError,
     frontend::{
         client::{TransactionType, transaction_type::Transaction},
         router::parser::{explain_trace::ExplainTrace, rewrite::statement::plan::RewriteResult},
     },
     net::{
-        DataRow, FromBytes, Message, Protocol, ProtocolMessage, Query, ReadyForQuery,
+        Bind, DataRow, FromBytes, Message, Protocol, ProtocolMessage, Query, ReadyForQuery,
         RowDescription, ToBytes, TransactionState,
     },
     state::State,
@@ -131,6 +132,27 @@ impl QueryEngine {
                 .await?;
             }
 
+            Some(RewriteResult::Subquery(subquery)) => {
+                // We get to here when detecting a Subquery in a top-level statement; this isn't recursed.
+                // Thus, we should now fetch the Bind, if present, and pass it in (at the top-level),
+                // so that we can supply the very top level's Bind to all sub-levels.
+                //
+                // TODO(jkaczman): don't need to do this if it's not extended protocol; do we have an easy way
+                // to find that out via a pre-computed flag?
+                let top_level_bind: Option<&Bind> =
+                    client_request.messages.iter().find_map(|message| {
+                        if let ProtocolMessage::Bind(bind) = message {
+                            Some(bind)
+                        } else {
+                            None
+                        }
+                    });
+
+                multi_step::SubqueryMulti::new(self, &subquery, top_level_bind)
+                    .execute(context, client_request)
+                    .await?;
+            }
+
             Some(RewriteResult::InPlace { .. }) | None => {
                 self.backend
                     .handle_client_request(client_request, &mut self.router, self.streaming)
@@ -140,8 +162,25 @@ impl QueryEngine {
                     && !self.backend.in_copy_mode()
                     && !self.streaming
                 {
-                    let message = self.read_server_message().await?;
-                    self.process_server_message(context, message).await?;
+                    match self.read_server_message().await {
+                        Ok(message) => self.process_server_message(context, message).await?,
+                        Err(err) => {
+                            if err.is_unsupported() {
+                                if let Some(transaction) = context.transaction.as_mut() {
+                                    transaction.set_error();
+                                }
+                                self.error_response(
+                                    context,
+                                    client_request,
+                                    ErrorResponse::unsupported(&err),
+                                )
+                                .await?;
+                                return Ok(());
+                            } else {
+                                return Err(err.into());
+                            }
+                        }
+                    }
                 }
             }
 
@@ -157,8 +196,8 @@ impl QueryEngine {
         Ok(())
     }
 
-    pub(crate) async fn read_server_message(&mut self) -> Result<Message, Error> {
-        Ok(self.backend.read().await?)
+    pub(crate) async fn read_server_message(&mut self) -> Result<Message, BackendError> {
+        self.backend.read().await
     }
 
     /// Handle a message received from Postgres.
@@ -189,6 +228,8 @@ impl QueryEngine {
             }
 
             'C' => {
+                self.backend
+                    .statement_completed(self.router.command().route());
                 self.emit_explain_rows(context).await?;
                 self.result_row_counter = 0;
             }
@@ -211,16 +252,9 @@ impl QueryEngine {
 
                 match state {
                     TransactionState::Error => {
-                        let error_state = match context.transaction.map(|t| t.transaction_type()) {
-                            Some(TransactionType::ReadOnly) => {
-                                Some(Transaction::new(TransactionType::ErrorReadOnly))
-                            }
-                            Some(TransactionType::ReadWrite | TransactionType::Implicit) => {
-                                Some(Transaction::new(TransactionType::ErrorReadWrite))
-                            }
-                            _ => None,
-                        };
-                        context.transaction = error_state;
+                        if let Some(transaction) = context.transaction.as_mut() {
+                            transaction.set_error();
+                        }
                         if self.two_pc.auto() {
                             self.end_two_pc(true).await?;
                             // TODO: this records a 2pc transaction in client
@@ -243,19 +277,25 @@ impl QueryEngine {
                             // Query parser is disabled, so the server is responsible for telling us
                             // we started a transaction.
                             None => {
-                                context.transaction =
-                                    Some(Transaction::new(TransactionType::ReadWrite));
+                                context.transaction = Some(Transaction::started_at(
+                                    TransactionType::ReadWrite,
+                                    context.statement_start,
+                                ));
                             }
 
                             // Restore transaction state after rollback to savepoint.
                             Some(TransactionType::ErrorReadOnly) => {
-                                context.transaction =
-                                    Some(Transaction::new(TransactionType::ReadOnly));
+                                context.transaction = Some(Transaction::started_at(
+                                    TransactionType::ReadOnly,
+                                    context.statement_start,
+                                ));
                             }
 
                             Some(TransactionType::ErrorReadWrite) => {
-                                context.transaction =
-                                    Some(Transaction::new(TransactionType::ReadWrite));
+                                context.transaction = Some(Transaction::started_at(
+                                    TransactionType::ReadWrite,
+                                    context.statement_start,
+                                ));
                             }
 
                             _ => (),
@@ -507,7 +547,7 @@ impl QueryEngine {
         {
             let error = ErrorResponse::in_failed_transaction();
 
-            self.error_response(context, client_request, error).await?;
+            self.send_error_response(context, error).await?;
 
             Ok(false)
         } else {
@@ -521,13 +561,22 @@ impl QueryEngine {
         client_request: &ClientRequest,
         mut error: ErrorResponse,
     ) -> Result<(), Error> {
-        error!("{:?} [{:?}]", error.message, context.stream.peer_addr());
-
         // Attach query context.
         if error.detail.is_none() {
             let query = client_request.query()?.map(|q| q.query().to_owned());
             error.detail = Some(query.unwrap_or_default());
         }
+
+        self.send_error_response(context, error).await
+    }
+
+    /// Send an error without adding fields to PostgreSQL-compatible responses.
+    pub(super) async fn send_error_response(
+        &mut self,
+        context: &mut QueryEngineContext<'_>,
+        error: ErrorResponse,
+    ) -> Result<(), Error> {
+        error!("{:?} [{:?}]", error.message, context.stream.peer_addr());
 
         self.hooks.on_engine_error(context, &error)?;
 

@@ -307,7 +307,7 @@ impl Client {
     /// Create new frontend client from the given TCP stream.
     async fn login(
         mut stream: Stream,
-        params: Parameters,
+        mut params: Parameters,
         addr: SocketAddr,
         config: Arc<ConfigAndUsers>,
         protocol_version: ProtocolVersion,
@@ -319,10 +319,11 @@ impl Client {
         }
 
         let (user, database) = user_database_from_params(&params);
+        let database = database.to_string();
         let admin = database == config.config.admin.name && config.config.admin.user == user;
         let admin_password = &config.config.admin.password;
-        let auth_type = &databases::databases()
-            .auth_type((user, database))
+        let auth_type = databases::databases()
+            .auth_type((user, database.as_str()))
             .unwrap_or(config.config.general.auth_type);
         // Empty string is treated as unset, mirroring config validation.
         let sts_server_id = config
@@ -356,7 +357,7 @@ impl Client {
             Self::check_password(
                 &mut stream,
                 user,
-                database,
+                &database,
                 &config.config.general.auth_type, // Admin auth uses general auth_type on purpose, which defaults to scram.
                 &passwords,
             )
@@ -376,7 +377,7 @@ impl Client {
                 AuthResult::NoPassthroughNoUser
             }
         } else {
-            match databases::databases().cluster((user, database)) {
+            match databases::databases().cluster((user, database.as_str())) {
                 Ok(cluster) => {
                     if let Some(identity) = cluster.identity() {
                         // mTLS authentication: the client certificate identity
@@ -415,7 +416,7 @@ impl Client {
                         // entries to plaintext before the auth exchange
                         let passwords =
                             crate::auth::vault::resolve_passwords(cluster.passwords()).await;
-                        Self::check_password(&mut stream, user, database, auth_type, &passwords)
+                        Self::check_password(&mut stream, user, &database, &auth_type, &passwords)
                             .await?
                     }
                 }
@@ -438,9 +439,9 @@ impl Client {
             // verdict: the client gets a retryable capacity error instead
             // of "wrong password".
             let error = if matches!(auth_result, AuthResult::StsVerificationOverloaded) {
-                ErrorResponse::auth_overloaded(user, database)
+                ErrorResponse::auth_overloaded(user, &database)
             } else {
-                ErrorResponse::auth(user, database)
+                ErrorResponse::auth(user, &database)
             };
             stream.fatal(error).await?;
             return Ok(None);
@@ -459,11 +460,11 @@ impl Client {
             return Ok(None);
         }
 
-        let mut conn = match Connection::new(user, database, admin) {
+        let mut conn = match Connection::new(user, &database, admin) {
             Ok(conn) => conn,
             Err(err) => {
                 debug!("connection error: {}", err);
-                stream.fatal(ErrorResponse::auth(user, database)).await?;
+                stream.fatal(ErrorResponse::auth(user, &database)).await?;
                 return Ok(None);
             }
         };
@@ -479,7 +480,7 @@ impl Client {
                         addr
                     );
                     stream
-                        .fatal(ErrorResponse::connection(user, database))
+                        .fatal(ErrorResponse::connection(user, &database))
                         .await?;
                     return Ok(None);
                 } else {
@@ -488,8 +489,8 @@ impl Client {
             }
         };
 
-        for param in server_params {
-            stream.send(&param).await?;
+        for param in &server_params {
+            stream.send(param).await?;
         }
 
         stream.send(&key).await?;
@@ -502,7 +503,7 @@ impl Client {
                 user,
                 database,
                 addr,
-                auth_method_label(passthrough, sts_auth, auth_type),
+                auth_method_label(passthrough, sts_auth, &auth_type),
                 if stream.is_tls() { "🔒" } else { "" }
             );
         }
@@ -512,6 +513,10 @@ impl Client {
             user, params, addr
         );
 
+        params.set_server_defaults(&server_params);
+
+        let sticky = Sticky::from_params(&params);
+
         Ok(Some(Self {
             addr,
             stream,
@@ -519,7 +524,7 @@ impl Client {
             comms,
             admin,
             streaming: false,
-            params: ParameterStore::new(params.clone()),
+            params: ParameterStore::new(params),
             prepared_statements: PreparedStatements::new(),
             transaction: None,
             timeouts: Timeouts::from_config(&config.config.general),
@@ -528,8 +533,8 @@ impl Client {
                 config.config.memory.message_buffer,
                 config.config.general.frontend_query_size_limit_block(),
             ),
-            sticky: Sticky::from_params(&params),
-            database: database.to_string(),
+            sticky,
+            database,
             query_log_stdout: false,
             query_size_limit: None,
             statement_start: Utc::now(),
@@ -706,8 +711,10 @@ impl Client {
             QueryEngineResult::Split { requests, extended } => {
                 let mut requests = requests.into_iter();
                 if extended {
-                    self.transaction
-                        .get_or_insert(Transaction::new(TransactionType::Implicit));
+                    self.transaction.get_or_insert(Transaction::started_at(
+                        TransactionType::Implicit,
+                        self.statement_start,
+                    ));
                 }
 
                 while let Some(mut request) = requests.next() {
@@ -805,23 +812,25 @@ impl Client {
             }
         }
 
-        let elapsed_time = Utc::now() - self.statement_start;
-        if !enabled!(LogLevel::TRACE) {
-            debug!(
-                "request buffered [{:.4}ms] {:?}",
-                elapsed_time.as_seconds_f64() * 1000.0,
-                self.client_request
-                    .messages
-                    .iter()
-                    .map(|m| m.code())
-                    .collect::<Vec<_>>(),
-            );
-        } else {
-            trace!(
-                "request buffered [{:.4}ms]\n{:#?}",
-                elapsed_time.as_seconds_f64() * 1000.0,
-                self.client_request,
-            );
+        if enabled!(LogLevel::DEBUG) {
+            let elapsed_time = Utc::now() - self.statement_start;
+            if !enabled!(LogLevel::TRACE) {
+                debug!(
+                    "request buffered [{:.4}ms] {:?}",
+                    elapsed_time.as_seconds_f64() * 1000.0,
+                    self.client_request
+                        .messages
+                        .iter()
+                        .map(|m| m.code())
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                trace!(
+                    "request buffered [{:.4}ms]\n{:#?}",
+                    elapsed_time.as_seconds_f64() * 1000.0,
+                    self.client_request,
+                );
+            }
         }
 
         Ok(BufferEvent::HaveRequest)

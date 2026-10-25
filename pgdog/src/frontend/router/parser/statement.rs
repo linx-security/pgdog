@@ -5,6 +5,7 @@ use std::sync::Arc;
 use super::{
     StatementParameters,
     advisory_lock::{AdvisoryLocks, advisory_locks_from_func_call, collect_values_columns},
+    function::Function,
 };
 use crate::util::ResultControlFlowExt;
 use itertools::*;
@@ -27,6 +28,8 @@ struct Walk<'a> {
     /// Names introduced by `WITH` clauses. An unqualified reference to one
     /// of these is the CTE, not a table.
     cte_names: HashSet<&'a str>,
+    mutates: bool,
+    cross_shard: bool,
 }
 
 /// Cursor over the client-visible SELECT targets, before any star expansion.
@@ -59,6 +62,8 @@ struct SearchContext<'a> {
     aliases: HashMap<&'a str, Table<'a>>,
     /// The primary table from the FROM clause (if simple)
     table: Option<Table<'a>>,
+    /// Base tables in this FROM clause, without descending into subqueries.
+    tables: Vec<Table<'a>>,
     /// Column equalities that can carry a key from one side of a join to the other.
     joined_columns: Vec<(Column<'a>, Column<'a>)>,
 }
@@ -66,12 +71,6 @@ struct SearchContext<'a> {
 impl<'a> SearchContext<'a> {
     /// Build context from a FROM clause, extracting table aliases.
     fn from_from_clause(nodes: &'a list::NodeList) -> Self {
-        let mut aliases = HashMap::new();
-
-        for node in nodes {
-            Self::extract_alias_from_node(&mut aliases, node);
-        }
-
         let table = nodes
             .into_iter()
             .exactly_one()
@@ -79,11 +78,11 @@ impl<'a> SearchContext<'a> {
             .and_then(|n| Table::try_from(n).ok());
 
         let mut ctx = Self {
-            aliases,
             table,
             ..Default::default()
         };
         for node in nodes {
+            ctx.extract_table_from_node(node);
             ctx.extract_joined_columns(node);
         }
         ctx
@@ -158,23 +157,27 @@ impl<'a> SearchContext<'a> {
         });
     }
 
-    fn extract_alias_from_node(aliases: &mut HashMap<&'a str, Table<'a>>, node: Node<'a>) {
+    fn extract_table_from_node(&mut self, node: Node<'a>) {
         match node {
-            Node::RangeVar(rv) if let Some(alias) = rv.alias() => {
+            Node::RangeVar(rv) => {
                 let table = Table::from(rv);
-                aliases.insert(alias.aliasname().expect("alias name always present"), table);
+                self.tables.push(table);
+                if let Some(alias) = rv.alias() {
+                    self.aliases
+                        .insert(alias.aliasname().expect("alias name always present"), table);
+                }
             }
 
             Node::JoinExpr(join) => {
-                Self::extract_alias_from_node(aliases, join.larg());
-                Self::extract_alias_from_node(aliases, join.rarg());
+                self.extract_table_from_node(join.larg());
+                self.extract_table_from_node(join.rarg());
             }
 
             Node::RangeSubselect(subselect) if let Some(alias) = subselect.alias() => {
                 // For subselects, we don't have a real table name
                 // but we record the alias anyway for future use
                 let aliasname = alias.aliasname().expect("alias name always present");
-                aliases.insert(
+                self.aliases.insert(
                     aliasname,
                     Table {
                         name: aliasname,
@@ -279,6 +282,11 @@ pub(crate) struct StatementParser<'a, 'b> {
     /// Sharding key lookups that missed the cache and need to be resolved.
     pending_lookups: Vec<PendingLookup>,
     resolved_lookups: Option<&'b ResolvedLookups>,
+
+    /// When recursing, if we see a subquery, should we recurse into it or ignore it?
+    /// Added for the ability to try to `shard()` the top-level statement (ignoring any subqueries within)
+    /// to see if there's a sharding key or not, to determine solely the top-level's routing
+    ignore_subqueries: bool,
 }
 
 impl<'a, 'b: 'a> StatementParser<'a, 'b> {
@@ -298,7 +306,19 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
             all_omnisharded: None,
             pending_lookups: Vec::new(),
             resolved_lookups: None,
+            ignore_subqueries: false,
         }
+    }
+
+    pub(crate) fn new_that_ignore_subqueries(
+        stmt: Node<'a>,
+        bind: Option<StatementParameters<'b>>,
+        schema: &'b ShardingSchema,
+    ) -> Self {
+        let mut parser = StatementParser::new(stmt, bind, schema);
+        parser.ignore_subqueries = true;
+
+        parser
     }
 
     /// Attach sharding key translations resolved for this statement.
@@ -447,9 +467,7 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
 
             // Check named sharded table configs (fast path, no schema lookup needed)
             for config in &named {
-                if let Some(ref name) = config.name
-                    && table.name == name
-                {
+                if config.name_matches(table.name) {
                     // Also check schema match if specified in config
                     if let Some(ref config_schema) = config.schema
                         && table.schema != Some(config_schema.as_str())
@@ -479,6 +497,14 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
     /// Extract pg_advisory_lock / pg_advisory_unlock calls with literal integer keys.
     pub(crate) fn extract_advisory_locks(&mut self) -> AdvisoryLocks {
         self.walk().advisory_locks.clone()
+    }
+
+    pub(crate) fn mutates(&mut self) -> bool {
+        self.walk().mutates
+    }
+
+    pub(crate) fn is_cross_shard(&mut self) -> bool {
+        self.walk().cross_shard
     }
 
     // Are we running? Or walking? MAKE UP YOUR MIND DAMMIT
@@ -562,6 +588,13 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
             // Extract any advisory locks that this function call may
             // represent, using the values clause of the current statement
             Node::FuncCall(func) => {
+                if let Some(function) =
+                    Function::from_strings(func.funcname().into_iter().filter_map(Node::as_str))
+                {
+                    let behavior = function.behavior();
+                    walk.cross_shard |= behavior.cross_shard;
+                    walk.mutates |= behavior.writes;
+                }
                 let column_index = walk
                     .projection
                     .as_ref()
@@ -586,6 +619,12 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
                 if let Some(name) = cte.ctename() {
                     walk.cte_names.insert(name);
                 }
+                walk.mutates |= !matches!(cte.ctequery(), Node::SelectStmt(_));
+                Recurse::yes()
+            }
+
+            Node::LockingClause(_) => {
+                walk.mutates = true;
                 Recurse::yes()
             }
 
@@ -816,9 +855,7 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
     }
 
     fn search_stmt(&mut self, stmt: Node<'a>) -> ControlFlow<Result<Shard, Error>> {
-        use nodes::{A_Expr_Kind, BoolExprType};
-
-        let ctx = match stmt {
+        let mut ctx = match stmt {
             Node::SelectStmt(s) => SearchContext::from_from_clause(s.from_clause()),
             Node::UpdateStmt(s) => self.context_from_relation(s.relation()),
             Node::DeleteStmt(s) => self.context_from_relation(s.relation()),
@@ -832,15 +869,42 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
             _ => return ControlFlow::Continue(()),
         };
 
+        // A CTE can shadow a configured table without preserving its columns.
+        let cte_names = &self.walk().cte_names;
+        ctx.tables
+            .retain(|table| table.schema.is_some() || !cte_names.contains(table.name));
+
         if let Node::SelectStmt(select) = stmt
             && !ctx.joined_columns.is_empty()
         {
             self.search_joined_key(select.where_clause(), &ctx)?;
         }
 
+        self.search_node(stmt, &ctx)
+    }
+
+    fn search_node(
+        &mut self,
+        stmt: Node<'a>,
+        ctx: &SearchContext<'a>,
+    ) -> ControlFlow<Result<Shard, Error>> {
+        use nodes::{A_Expr_Kind, BoolExprType, JoinType};
+
         let result = walk::walk_manual(stmt, |node| match node {
             Node::SelectStmt(_) => {
-                self.search_stmt(node)?;
+                if !self.ignore_subqueries {
+                    self.search_stmt(node)?;
+                }
+                Recurse::no()
+            }
+
+            Node::JoinExpr(join) if join.jointype != JoinType::JOIN_INNER => {
+                // An outer join's ON clause does not restrict rows from its
+                // preserved side. Don't infer new key owners there; WHERE
+                // predicates still use the enclosing query's table context.
+                let mut ctx = ctx.clone();
+                ctx.tables.clear();
+                self.search_node(node, &ctx)?;
                 Recurse::no()
             }
 
@@ -860,8 +924,8 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
 
                 let is_any = matches!(expr.kind, A_Expr_Kind::AEXPR_OP_ANY);
 
-                let left = self.search_expr(expr.lexpr(), &ctx)?;
-                let right = self.search_expr(expr.rexpr(), &ctx)?;
+                let left = self.search_expr(expr.lexpr(), ctx)?;
+                let right = self.search_expr(expr.rexpr(), ctx)?;
 
                 let Some(left) = left else {
                     return Recurse::no();
@@ -880,11 +944,12 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
                         let shards = values
                             .iter()
                             .filter_map(|value| {
-                                self.compute_shard_with_ctx(column, value.clone(), &ctx)
+                                self.compute_shard_with_ctx(column, value.clone(), ctx)
                                     .transpose()
                             })
                             .collect::<Result<Vec<_>, _>>()
                             .break_err()?;
+
                         match Self::converge(&shards) {
                             Some(shard) => ControlFlow::Break(Ok(shard)),
                             None => Recurse::no(),
@@ -1025,6 +1090,28 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
                 {
                     column.qualify(*table);
                 }
+                // In joins, a named sharding config can identify the owner
+                // of an otherwise unqualified key. Only consider tables in
+                // this query scope, and leave ambiguous keys unresolved.
+                if column.table.is_none()
+                    && let Ok(table) = ctx
+                        .tables
+                        .iter()
+                        .filter(|table| {
+                            self.get_sharded_table_by_name(
+                                column.name,
+                                Some(table.name),
+                                table.schema,
+                            )
+                            .is_some_and(|config| config.name.is_some())
+                        })
+                        .exactly_one()
+                {
+                    // Keep the SQL reference until resolve_column resolves
+                    // aliases; another table may use this table's name as an alias.
+                    column.table = Some(table.alias.unwrap_or(table.name));
+                    column.schema = table.schema;
+                }
                 ControlFlow::Continue(Some(SearchResult::Column(column)))
             }
 
@@ -1039,7 +1126,13 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
             // the route.
             _ => {
                 let result = walk::walk_manual(node, |node| match node {
-                    Node::SelectStmt(_) => self.search_stmt(node).map_continue(|_| Recurse::No),
+                    Node::SelectStmt(_) => {
+                        if !self.ignore_subqueries {
+                            self.search_stmt(node).map_continue(|_| Recurse::No)
+                        } else {
+                            Recurse::no()
+                        }
+                    }
                     _ => Recurse::yes(),
                 })
                 .transpose()

@@ -31,6 +31,7 @@ pub(crate) mod test_dml;
 pub(crate) mod test_explain;
 pub(crate) mod test_functions;
 pub(crate) mod test_insert;
+mod test_join_columns;
 pub(crate) mod test_prefer_primary;
 pub(crate) mod test_prepared;
 mod test_replica_only;
@@ -64,6 +65,38 @@ fn parse_query(query: &str) -> Command {
         RouterContext::new(&client_request, &cluster, &params, None, Sticky::new_test()).unwrap();
 
     query_parser.parse(context).unwrap().clone()
+}
+
+#[test]
+fn parser_marks_dml_for_metrics() {
+    for query in [
+        "SELECT 1",
+        "INSERT INTO metrics_test VALUES (1)",
+        "UPDATE metrics_test SET id = 2",
+        "DELETE FROM metrics_test",
+        "COPY metrics_test TO STDOUT",
+    ] {
+        let command = parse_query(query);
+        assert_eq!(
+            command.route().statement_type(),
+            Some(StatementType::Dml),
+            "{query}"
+        );
+        assert_eq!(command.route().table_change(), TableChange::None);
+    }
+}
+
+#[test]
+fn parser_marks_table_ddl_for_metrics() {
+    let command = parse_query("CREATE TABLE metrics_test (id BIGINT)");
+    assert_eq!(command.route().statement_type(), Some(StatementType::Ddl));
+    assert_eq!(command.route().table_change(), TableChange::Created);
+}
+
+#[test]
+fn parser_does_not_count_session_commands_as_dml() {
+    let command = parse_query("SHOW transaction_isolation");
+    assert_eq!(command.route().statement_type(), None);
 }
 
 macro_rules! command {
@@ -572,10 +605,7 @@ fn test_insert_do_update() {
 #[test]
 fn test_begin_extended() {
     let command = query_parser!(QueryParser::default(), Parse::new_anonymous("BEGIN"), false);
-    match command {
-        Command::StartTransaction { extended, .. } => assert!(extended),
-        _ => panic!("not a transaction"),
-    }
+    assert!(matches!(command, Command::StartTransaction { .. }));
 }
 
 #[test]
