@@ -25,6 +25,7 @@
       "description": "General settings are relevant to the operations of the pooler itself, or apply to all database pools.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/>",
       "$ref": "#/$defs/General",
       "default": {
+        "auth_token_cache_size": 1000,
         "auth_type": "scram",
         "background_workers": 0,
         "ban_replica_lag": 9223372036854775807,
@@ -82,10 +83,11 @@
         "openmetrics_namespace": null,
         "openmetrics_port": null,
         "passthrough_auth": "disabled",
+        "passthrough_auth_debounce_delay": 1000,
         "pooler_mode": "transaction",
         "port": 6432,
         "prepared_statements": "extended",
-        "prepared_statements_limit": 9223372036854775807,
+        "prepared_statements_limit": 5000,
         "prepared_statements_ttl": null,
         "prepared_statements_ttl_jitter": 30000,
         "pub_sub_channel_size": 0,
@@ -107,6 +109,7 @@
         "resharding_copy_retry_max_attempts": 5,
         "resharding_copy_retry_min_delay": 1000,
         "resharding_parallel_copies": 1,
+        "resharding_parallel_within_table_copies": 1,
         "resharding_replication_retry_max_attempts": 5,
         "resharding_replication_retry_min_delay": 1000,
         "rollback_timeout": 5000,
@@ -117,6 +120,7 @@
         "shutdown_termination_timeout": null,
         "shutdown_timeout": 60000,
         "stats_period": 15000,
+        "sts_server_id": null,
         "system_catalogs": "omnisharded_sticky",
         "tls_certificate": null,
         "tls_client_ca_certificate": null,
@@ -233,7 +237,8 @@
         "non_deterministic_functions": "ignore",
         "primary_key": "ignore",
         "shard_key": "error",
-        "split_inserts": "error"
+        "split_inserts": "error",
+        "subqueries": "ignore"
       }
     },
     "sharded_mappings": {
@@ -330,6 +335,11 @@
           "description": "Plaintext password.",
           "type": "string",
           "const": "plain"
+        },
+        {
+          "description": "RDS IAM or Azure Workload identity.",
+          "type": "string",
+          "const": "external_token"
         }
       ]
     },
@@ -694,6 +704,13 @@
       "description": "General settings are relevant to the operations of the pooler itself, or apply to all database pools.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/>",
       "type": "object",
       "properties": {
+        "auth_token_cache_size": {
+          "description": "Size of the client token passthrough cache.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 1000,
+          "minimum": 0
+        },
         "auth_type": {
           "description": "What kind of authentication mechanism to use for client connections.\n\n_Default:_ `scram`\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/#auth_type>",
           "$ref": "#/$defs/AuthType",
@@ -1067,6 +1084,13 @@
           "$ref": "#/$defs/PassthroughAuth",
           "default": "disabled"
         },
+        "passthrough_auth_debounce_delay": {
+          "description": "Passthrough auth debounce delay.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 1000,
+          "minimum": 0
+        },
         "pooler_mode": {
           "description": "Default pooler mode to use for database pools.\n\n_Default:_ `transaction`\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/#pooler_mode>",
           "$ref": "#/$defs/PoolerMode",
@@ -1089,7 +1113,7 @@
           "description": "Number of prepared statements that will be allowed for each server connection.\n\n**Note:** If this limit is reached, the least used statement is closed and replaced with the newest one. Additionally, any unused statements in the global cache above this limit will be removed.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/#prepared_statements_limit>",
           "type": "integer",
           "format": "uint",
-          "default": 9223372036854775807,
+          "default": 5000,
           "minimum": 0
         },
         "prepared_statements_ttl": {
@@ -1226,6 +1250,13 @@
           "default": 1,
           "minimum": 0
         },
+        "resharding_parallel_within_table_copies": {
+          "description": "How many source copies we'll launch for a singular table copy.\nRecommended when dealing with TOAST-heavy tables, which usually\ncost multiple disk reads and bound the stream by read latency,\nespecially with a cold cache.\n\nWhen used effectively, this will massively speed up table copies\nby a factor of what this is set to (e.g., 30x, depending on disk IOPS),\nfully utilizing the disk IOPS.",
+          "type": "integer",
+          "format": "uint",
+          "default": 1,
+          "minimum": 0
+        },
         "resharding_replication_retry_max_attempts": {
           "description": "Maximum number of consecutive replication-subscriber errors tolerated before\nthe source error is propagated. Each failure triggers `slot.reconnect()`,\nafter which Postgres re-streams every event since the last acked commit.\n`0` retries indefinitely.\n\n_Default:_ `5`\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/#resharding_replication_retry_max_attempts>",
           "type": "integer",
@@ -1298,6 +1329,13 @@
           "format": "uint64",
           "default": 15000,
           "minimum": 0
+        },
+        "sts_server_id": {
+          "description": "Audience identifier for AWS STS client authentication. Clients sign this value\ninto the `x-pgdog-server-id` header of the presigned STS GetCallerIdentity URL\nthey present as their password.\n\n**Note:** Required when any user sets `allowed_iam_arns` in `users.toml`.\n\n_Default:_ `None` (STS client authentication disabled)",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "system_catalogs": {
           "description": "Changes how system catalog tables (like `pg_database`, `pg_class`, etc.) are treated by the query router.\n\n_Default:_ `omnisharded_sticky`\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/#system_catalogs>",
@@ -1984,6 +2022,11 @@
           "description": "Behavior for multi-row `INSERT` on sharded tables: `error` rejects, `rewrite` distributes rows to their shards, `ignore` forwards unchanged.\n\n_Default:_ `error`\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/rewrite/#split_inserts>",
           "$ref": "#/$defs/RewriteMode",
           "default": "error"
+        },
+        "subqueries": {
+          "description": "Behavior for queries containing subqueries: `rewrite` executes the subquery separately and injects its results into the outer query\n\n**Note:** Highly experimental and in development. Do not use in production.\n\n_Default:_ `ignore`",
+          "$ref": "#/$defs/RewriteMode",
+          "default": "ignore"
         }
       },
       "additionalProperties": false
@@ -2330,6 +2373,11 @@
             "null"
           ],
           "default": null
+        },
+        "prefix": {
+          "description": "Treat `name` as a prefix, e.g. `name = \"users\"` also matches `users_1` and `users_archive`.\n\n_Default:_ `false`",
+          "type": "boolean",
+          "default": false
         },
         "primary": {
           "description": "Marks this table as the primary sharding anchor (e.g. `users`). PgDog uses the primary table to resolve foreign-key relationships when routing queries.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#primary>",

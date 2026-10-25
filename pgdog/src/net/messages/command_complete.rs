@@ -63,21 +63,6 @@ impl CommandComplete {
         Ok(Self::from_str(&parts.join(" ")))
     }
 
-    /// Start transaction.
-    pub(crate) fn new_begin() -> Self {
-        Self::from_str("BEGIN")
-    }
-
-    /// Rollback transaction.
-    pub(crate) fn new_rollback() -> Self {
-        Self::from_str("ROLLBACK")
-    }
-
-    /// Commit transaction.
-    pub(crate) fn new_commit() -> Self {
-        Self::from_str("COMMIT")
-    }
-
     pub(crate) fn new(command: impl AsRef<str>) -> Self {
         Self::from_str(command.as_ref())
     }
@@ -130,6 +115,13 @@ mod test {
         let delete = CommandComplete::from_str("DELETE 2");
         assert_eq!(delete.tag(), "DELETE");
         assert_eq!(delete.rows().unwrap(), Some(2));
+    }
+
+    #[test]
+    fn rows_and_tag_for_copy() {
+        let copy = CommandComplete::from_str("COPY 42");
+        assert_eq!(copy.tag(), "COPY");
+        assert_eq!(copy.rows().unwrap(), Some(42));
     }
 
     #[test]

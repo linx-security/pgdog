@@ -15,14 +15,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Level as LogLevel, debug, enabled, error, info, trace, warn};
 
 use super::{ClientRequest, Error, PreparedStatements};
-use crate::auth::AuthResult;
-use crate::auth::{md5, scram::Server};
-use crate::backend::maintenance_mode;
+use crate::auth::{AUTH_TOKEN_CACHE, AuthResult, md5, scram::Server, sts};
 use crate::backend::pool::stats::MemoryStats;
 use crate::backend::{
     databases,
     pool::{Connection, Request},
 };
+use crate::backend::{maintenance_mode, passthrough_auth};
 use crate::config::convert::user_from_params;
 use crate::config::{self, AuthType, ConfigAndUsers, config};
 use crate::frontend::ClientComms;
@@ -30,7 +29,8 @@ use crate::net::messages::{
     Authentication, BackendKeyData, ErrorResponse, FromBytes, FrontendPid, Message, Password,
     Protocol, ProtocolVersion, ReadyForQuery, ToBytes, scram_challenge,
 };
-use crate::net::{MessageBuffer, ProtocolMessage, Stream, parameter::Parameters};
+use crate::net::{MessageBuffer, ProtocolMessage, Stream};
+use crate::parameters::{ParameterStore, Parameters};
 use crate::state::State;
 use crate::stats::memory::MemoryUsage;
 use crate::util::{safe_timeout, user_database_from_params};
@@ -59,9 +59,7 @@ pub(crate) struct Client {
     key: BackendKeyData,
     // Client startup parameters. Keeps track of any parameters
     // the client changes at runtime with `SET` as well.
-    params: Parameters,
-    // Parameters exactly as they came in the startup message.
-    startup_params: Parameters,
+    params: ParameterStore,
     // Process-global communication primitives used for clients
     // to talk to each other, e.g. to track their own state.
     comms: ClientComms,
@@ -182,10 +180,11 @@ impl Client {
     async fn check_password(
         stream: &mut Stream,
         user: &str,
+        database: &str,
         auth_type: &AuthType,
         passwords: &[PasswordKind],
     ) -> Result<AuthResult, Error> {
-        if passwords.is_empty() {
+        if passwords.is_empty() && !auth_type.external_token() {
             return Ok(AuthResult::NoPasswordConfig);
         }
 
@@ -241,7 +240,66 @@ impl Client {
             }
 
             AuthType::Trust => AuthResult::Ok,
+
+            AuthType::ExternalToken => {
+                stream
+                    .send_flush(&Authentication::ClearTextPassword)
+                    .await?;
+                // RDS also asks for the token in plaintext. I guess they don't care
+                // since it's short-lived? Also, they assume you connect via TLS. Either
+                // way we don't have a choice since we need to pass it as-is to RDS
+                // so we can't SCRAM it.
+                let response = stream.read().await?;
+                if let Some(password) = Password::from_bytes(response.to_bytes())?.password() {
+                    if AUTH_TOKEN_CACHE.check(user, database, password).await? {
+                        AuthResult::Ok
+                    } else {
+                        AuthResult::NoPasswordMatch
+                    }
+                } else {
+                    AuthResult::NoPasswordMatch
+                }
+            }
         };
+
+        Ok(result)
+    }
+
+    /// Authenticate a client that presents a presigned AWS STS
+    /// `GetCallerIdentity` URL as its password, mapping the verified
+    /// caller identity against the user's `allowed_iam_arns`.
+    async fn check_sts_token(
+        stream: &mut Stream,
+        user: &str,
+        server_id: &str,
+        allowed: &[String],
+    ) -> Result<AuthResult, Error> {
+        stream
+            .send_flush(&Authentication::ClearTextPassword)
+            .await?;
+        let response = Password::from_bytes(stream.read().await?.to_bytes())?;
+
+        let Some(token) = response.password() else {
+            return Ok(AuthResult::NoPasswordMessage);
+        };
+
+        let result =
+            match sts::verify(token, server_id, allowed, sts::StsTokenCache::global()).await {
+                Ok(validated) => {
+                    debug!(user, arn = validated.normalized_arn, "STS client auth ok");
+                    AuthResult::Ok
+                }
+                Err(sts::StsAuthError::TooManyVerifications) => {
+                    // Not a verdict on the token: no slot freed up in time.
+                    warn!(r#"user "{}" STS verification capacity exhausted"#, user);
+                    AuthResult::StsVerificationOverloaded
+                }
+                Err(err) => {
+                    // `err` never contains the token itself.
+                    warn!(r#"user "{}" STS token verification failed: {}"#, user, err);
+                    AuthResult::NoStsToken
+                }
+            };
 
         Ok(result)
     }
@@ -249,7 +307,7 @@ impl Client {
     /// Create new frontend client from the given TCP stream.
     async fn login(
         mut stream: Stream,
-        params: Parameters,
+        mut params: Parameters,
         addr: SocketAddr,
         config: Arc<ConfigAndUsers>,
         protocol_version: ProtocolVersion,
@@ -261,9 +319,19 @@ impl Client {
         }
 
         let (user, database) = user_database_from_params(&params);
+        let database = database.to_string();
         let admin = database == config.config.admin.name && config.config.admin.user == user;
         let admin_password = &config.config.admin.password;
-        let auth_type = &config.config.general.auth_type;
+        let auth_type = databases::databases()
+            .auth_type((user, database.as_str()))
+            .unwrap_or(config.config.general.auth_type);
+        // Empty string is treated as unset, mirroring config validation.
+        let sts_server_id = config
+            .config
+            .general
+            .sts_server_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
         let passthrough = config.config.general.passthrough_auth();
         let id = FrontendPid::new();
         let key = BackendKeyData::new_frontend(protocol_version, id);
@@ -278,11 +346,22 @@ impl Client {
         //
         // This is likely because passthrough authentication is enabled.
         //
+        // STS client auth reuses the regular password exchange (the presigned
+        // URL arrives in the password field), so the connect log needs its own
+        // record of the method — `auth_type` alone can't distinguish it.
+        let mut sts_auth = false;
         let auth_result = if admin {
             // The admin database is virtual and never present in the cluster
             // map, so authenticate directly against the configured admin password.
             let passwords = [PasswordKind::Plain(admin_password.clone())];
-            Self::check_password(&mut stream, user, auth_type, &passwords).await?
+            Self::check_password(
+                &mut stream,
+                user,
+                &database,
+                &config.config.general.auth_type, // Admin auth uses general auth_type on purpose, which defaults to scram.
+                &passwords,
+            )
+            .await?
         } else if passthrough {
             // Get the password. We always need it because we need to check if
             // it's current and hasn't been changed.
@@ -291,18 +370,14 @@ impl Client {
                 .await?;
             let password = stream.read().await?;
             let password = Password::from_bytes(password.to_bytes())?;
-            // Passthrough authentication assumes the client password is good
-            // and lets Postgres perform the authentication instead. If Postgres
-            // returns an error, the connection pool will be banned and the client
-            // won't be able to run queries.
             let user = user_from_params(&params, &password).ok();
             if let Some(user) = user {
-                databases::add(user)?
+                passthrough_auth::check_or_add(user).await?
             } else {
                 AuthResult::NoPassthroughNoUser
             }
         } else {
-            match databases::databases().cluster((user, database)) {
+            match databases::databases().cluster((user, database.as_str())) {
                 Ok(cluster) => {
                     if let Some(identity) = cluster.identity() {
                         // mTLS authentication: the client certificate identity
@@ -323,12 +398,26 @@ impl Client {
                         // Asked for a certificate and declined. Users that opt out
                         // fall through to password authentication instead.
                         AuthResult::NoClientCertificate
+                    } else if let Some(server_id) = sts_server_id
+                        && !cluster.allowed_iam_arns().is_empty()
+                    {
+                        // STS client auth: the password is a presigned
+                        // AWS STS GetCallerIdentity URL.
+                        sts_auth = true;
+                        Self::check_sts_token(
+                            &mut stream,
+                            user,
+                            server_id,
+                            cluster.allowed_iam_arns(),
+                        )
+                        .await?
                     } else {
                         // Resolve Vault static role
                         // entries to plaintext before the auth exchange
                         let passwords =
                             crate::auth::vault::resolve_passwords(cluster.passwords()).await;
-                        Self::check_password(&mut stream, user, auth_type, &passwords).await?
+                        Self::check_password(&mut stream, user, &database, &auth_type, &passwords)
+                            .await?
                     }
                 }
 
@@ -337,13 +426,24 @@ impl Client {
         };
 
         if !auth_result.is_ok() {
+            // The reason is only for logs and metrics.
+            crate::stats::client_auth::record_failure(auth_result.reason());
             if log_connections {
                 warn!(
                     r#"user "{}" and database "{}" auth error: {}"#,
                     user, database, auth_result
                 );
             }
-            stream.fatal(ErrorResponse::auth(user, database)).await?;
+            // Credential verdicts share one uniform error so the outcome
+            // leaks nothing about which check failed. Overload is not a
+            // verdict: the client gets a retryable capacity error instead
+            // of "wrong password".
+            let error = if matches!(auth_result, AuthResult::StsVerificationOverloaded) {
+                ErrorResponse::auth_overloaded(user, &database)
+            } else {
+                ErrorResponse::auth(user, &database)
+            };
+            stream.fatal(error).await?;
             return Ok(None);
         } else {
             stream.send(&Authentication::Ok).await?;
@@ -360,11 +460,11 @@ impl Client {
             return Ok(None);
         }
 
-        let mut conn = match Connection::new(user, database, admin) {
+        let mut conn = match Connection::new(user, &database, admin) {
             Ok(conn) => conn,
             Err(err) => {
                 debug!("connection error: {}", err);
-                stream.fatal(ErrorResponse::auth(user, database)).await?;
+                stream.fatal(ErrorResponse::auth(user, &database)).await?;
                 return Ok(None);
             }
         };
@@ -380,7 +480,7 @@ impl Client {
                         addr
                     );
                     stream
-                        .fatal(ErrorResponse::connection(user, database))
+                        .fatal(ErrorResponse::connection(user, &database))
                         .await?;
                     return Ok(None);
                 } else {
@@ -389,8 +489,8 @@ impl Client {
             }
         };
 
-        for param in server_params {
-            stream.send(&param).await?;
+        for param in &server_params {
+            stream.send(param).await?;
         }
 
         stream.send(&key).await?;
@@ -403,11 +503,7 @@ impl Client {
                 user,
                 database,
                 addr,
-                if passthrough {
-                    "passthrough".into()
-                } else {
-                    auth_type.to_string()
-                },
+                auth_method_label(passthrough, sts_auth, &auth_type),
                 if stream.is_tls() { "🔒" } else { "" }
             );
         }
@@ -417,6 +513,10 @@ impl Client {
             user, params, addr
         );
 
+        params.set_server_defaults(&server_params);
+
+        let sticky = Sticky::from_params(&params);
+
         Ok(Some(Self {
             addr,
             stream,
@@ -424,8 +524,7 @@ impl Client {
             comms,
             admin,
             streaming: false,
-            startup_params: params.clone(),
-            params: params.clone(),
+            params: ParameterStore::new(params),
             prepared_statements: PreparedStatements::new(),
             transaction: None,
             timeouts: Timeouts::from_config(&config.config.general),
@@ -434,8 +533,8 @@ impl Client {
                 config.config.memory.message_buffer,
                 config.config.general.frontend_query_size_limit_block(),
             ),
-            sticky: Sticky::from_params(&params),
-            database: database.to_string(),
+            sticky,
+            database,
             query_log_stdout: false,
             query_size_limit: None,
             statement_start: Utc::now(),
@@ -474,8 +573,7 @@ impl Client {
                 config().config.general.frontend_query_size_limit_block(),
             ),
             sticky: Sticky::from_params(&params),
-            startup_params: params.clone(),
-            params,
+            params: ParameterStore::new(params),
             database: "pgdog".to_string(),
             query_log_stdout: false,
             query_size_limit: None,
@@ -613,8 +711,10 @@ impl Client {
             QueryEngineResult::Split { requests, extended } => {
                 let mut requests = requests.into_iter();
                 if extended {
-                    self.transaction
-                        .get_or_insert(Transaction::new(TransactionType::Implicit));
+                    self.transaction.get_or_insert(Transaction::started_at(
+                        TransactionType::Implicit,
+                        self.statement_start,
+                    ));
                 }
 
                 while let Some(mut request) = requests.next() {
@@ -712,23 +812,25 @@ impl Client {
             }
         }
 
-        let elapsed_time = Utc::now() - self.statement_start;
-        if !enabled!(LogLevel::TRACE) {
-            debug!(
-                "request buffered [{:.4}ms] {:?}",
-                elapsed_time.as_seconds_f64() * 1000.0,
-                self.client_request
-                    .messages
-                    .iter()
-                    .map(|m| m.code())
-                    .collect::<Vec<_>>(),
-            );
-        } else {
-            trace!(
-                "request buffered [{:.4}ms]\n{:#?}",
-                elapsed_time.as_seconds_f64() * 1000.0,
-                self.client_request,
-            );
+        if enabled!(LogLevel::DEBUG) {
+            let elapsed_time = Utc::now() - self.statement_start;
+            if !enabled!(LogLevel::TRACE) {
+                debug!(
+                    "request buffered [{:.4}ms] {:?}",
+                    elapsed_time.as_seconds_f64() * 1000.0,
+                    self.client_request
+                        .messages
+                        .iter()
+                        .map(|m| m.code())
+                        .collect::<Vec<_>>(),
+                );
+            } else {
+                trace!(
+                    "request buffered [{:.4}ms]\n{:#?}",
+                    elapsed_time.as_seconds_f64() * 1000.0,
+                    self.client_request,
+                );
+            }
         }
 
         Ok(BufferEvent::HaveRequest)
@@ -757,6 +859,19 @@ impl Drop for Client {
     }
 }
 
+/// Label for the connect log naming the authentication method that actually
+/// ran. STS is wire-compatible with regular password auth, so the configured
+/// `auth_type` would mislabel STS connections as e.g. `scram`.
+fn auth_method_label(passthrough: bool, sts: bool, auth_type: &AuthType) -> String {
+    if passthrough {
+        "passthrough".into()
+    } else if sts {
+        "sts".into()
+    } else {
+        auth_type.to_string()
+    }
+}
+
 #[cfg(test)]
 impl Client {
     pub(crate) async fn spawn_test(mut self) {
@@ -770,7 +885,6 @@ impl MemoryUsage for Client {
             + std::mem::size_of::<Stream>()
             + std::mem::size_of::<BackendKeyData>()
             + self.params.memory_usage()
-            + self.startup_params.memory_usage()
             + std::mem::size_of::<ClientComms>()
             + std::mem::size_of::<bool>() * 5
             + self.prepared_statements.memory_used()
@@ -782,6 +896,26 @@ impl MemoryUsage for Client {
 
 #[cfg(test)]
 pub(crate) mod test;
+
+#[cfg(test)]
+mod auth_method_label_tests {
+    use super::{AuthType, auth_method_label};
+
+    #[test]
+    fn sts_connections_are_labeled_sts_not_the_wire_auth_type() {
+        // The STS handshake is SCRAM/plain-shaped on the wire, but the log
+        // must say which method actually authenticated the client.
+        assert_eq!(auth_method_label(false, true, &AuthType::Scram), "sts");
+        assert_eq!(auth_method_label(false, true, &AuthType::Plain), "sts");
+
+        // Non-STS connections keep their existing labels.
+        assert_eq!(auth_method_label(false, false, &AuthType::Scram), "scram");
+        assert_eq!(
+            auth_method_label(true, false, &AuthType::Scram),
+            "passthrough"
+        );
+    }
+}
 
 #[cfg(test)]
 mod client_certificate_tests {

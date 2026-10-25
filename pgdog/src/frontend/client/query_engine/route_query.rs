@@ -91,10 +91,15 @@ impl QueryEngine {
             }
         };
 
+        if self.router.skip(cluster, client_request, &context.sticky) {
+            client_request.route = Some(self.router.command().route().clone());
+            return Ok(true);
+        }
+
         let router_context = RouterContext::new(
             client_request,
             cluster,
-            context.params,
+            &*context.params,
             context.transaction,
             context.sticky,
         )?;
@@ -115,7 +120,7 @@ impl QueryEngine {
                         let router_context = RouterContext::new(
                             client_request,
                             cluster,
-                            context.params,
+                            &*context.params,
                             context.transaction,
                             context.sticky,
                         )?

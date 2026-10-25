@@ -9,6 +9,8 @@ use crate::{
 
 mod advisory_lock;
 mod advisory_unlock;
+
+mod bench;
 mod close_parse;
 mod close_parse_global_cache;
 mod cross_shard_disabled;
@@ -32,12 +34,15 @@ mod prepared_syntax_error;
 mod pub_sub;
 mod regression_auto_two_pc;
 mod regression_bind_transaction_end;
+mod regression_flush_error;
 mod regression_pinned_sync;
 mod regression_prepare_transaction_end;
 mod regression_prepare_transaction_end_idle;
 mod regression_prepare_transaction_end_params;
 mod regression_replica_only_transaction;
+mod regression_set_local_pin_transaction_end;
 mod regression_shard_directed_rollback;
+mod regression_transaction_read_write_stats;
 mod replicas;
 mod rewrite_extended;
 mod rewrite_insert_split;
@@ -46,6 +51,7 @@ mod rewrite_projection;
 mod rewrite_simple_prepared;
 mod schema_changed;
 mod set;
+mod set_batch;
 mod set_schema_sharding;
 mod sharded;
 mod sharded_prepared;
@@ -54,6 +60,7 @@ mod temp_table;
 mod test_omnisharded;
 mod transaction_state;
 mod two_pc_single_shard;
+mod unsupported_aggregation;
 
 pub(super) fn test_client() -> Client {
     load_test();
