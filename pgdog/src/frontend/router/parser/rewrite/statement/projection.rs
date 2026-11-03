@@ -9,7 +9,7 @@ use super::aggregate::{AggregatesRewrite, HelperKind};
 use super::offset::{self, OffsetPlan};
 use super::order_by;
 use crate::backend::schema::Schema;
-use crate::frontend::router::parser::{Aggregate, OrderBy};
+use crate::frontend::router::parser::{Aggregate, HavingExpr, HavingRewritePlan, OrderBy};
 use crate::frontend::{ClientRequest, PreparedStatements};
 use crate::net::{ProtocolMessage, RowDescription};
 use pg_raw_parse::{Node, StmtList, make};
@@ -53,15 +53,45 @@ impl OrderByHelper {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct ProjectionRewritePlan {
     pub(crate) aggregate_helpers: Vec<AggregateHelper>,
     pub(crate) order_by_helpers: Vec<OrderByHelper>,
+    pub(crate) having: Option<Box<HavingRewriteResult>>,
+}
+
+/// The filter and aggregate metadata produced by rewriting a HAVING query.
+#[derive(Debug, PartialEq)]
+pub(crate) struct HavingRewriteResult {
+    rewrite: HavingRewritePlan,
+    aggregate: Aggregate,
+}
+
+impl HavingRewriteResult {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new(rewrite: HavingRewritePlan, aggregate: Aggregate) -> Self {
+        Self { rewrite, aggregate }
+    }
+
+    pub(crate) fn expression(&self) -> &HavingExpr {
+        self.rewrite.expression()
+    }
+
+    pub(crate) fn hidden_aliases(&self) -> &[String] {
+        self.rewrite.hidden_aliases()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn aggregate(&self) -> &Aggregate {
+        &self.aggregate
+    }
 }
 
 impl ProjectionRewritePlan {
     pub(crate) fn is_noop(&self) -> bool {
-        self.aggregate_helpers.is_empty() && self.order_by_helpers.is_empty()
+        self.aggregate_helpers.is_empty()
+            && self.order_by_helpers.is_empty()
+            && self.having.is_none()
     }
 
     pub(crate) fn drop_columns(&self, row_description: &RowDescription) -> BTreeSet<usize> {
@@ -74,6 +104,11 @@ impl ProjectionRewritePlan {
                     .filter(|helper| helper.injected)
                     .map(|helper| helper.alias.as_str()),
             )
+            .chain(
+                self.having
+                    .iter()
+                    .flat_map(|plan| plan.hidden_aliases().iter().map(String::as_str)),
+            )
             .filter_map(|alias| row_description.field_index(alias))
             .collect()
     }
@@ -82,7 +117,7 @@ impl ProjectionRewritePlan {
 #[derive(Debug, Clone)]
 pub(crate) struct PostRouteRewrite {
     sql: Arc<str>,
-    plan: ProjectionRewritePlan,
+    plan: Option<Arc<ProjectionRewritePlan>>,
 }
 
 pub(crate) fn finalize_after_route(
@@ -144,12 +179,12 @@ pub(crate) fn finalize_after_route(
     {
         parse.set_query(&rewrite.sql);
     }
-    if !rewrite.plan.is_noop()
+    if let Some(plan) = &rewrite.plan
         && let Some(route) = request.route.as_mut()
     {
-        route.projection_rewrite_plan = rewrite.plan.clone();
+        route.projection_rewrite_plan = Some(Arc::clone(plan));
         let mut order_by = route.order_by().to_vec();
-        for helper in &rewrite.plan.order_by_helpers {
+        for helper in &plan.order_by_helpers {
             // Prefer the structural position. The source fallback handles a
             // bind-dependent vector sort omitted from this execution's route.
             let position = order_by
@@ -180,10 +215,29 @@ fn build(
     let Some(Node::SelectStmt(select)) = ast.stmts().next() else {
         return Ok(None);
     };
+    if !matches!(select.having_clause(), Node::None) {
+        return Err(Error::UnsupportedHaving(
+            "aggregates would be filtered on each shard before merging",
+        ));
+    }
 
     let aggregate = Aggregate::parse(select, schema);
     if aggregate.is_empty() && select.sort_clause().is_empty() && !rewrite_offset {
         return Ok(None);
+    }
+
+    // We can't sort by an expression with an aggregate in it, e.g., `ORDER BY count(*)`.
+    // Each shard runs the aggregate ONLY on the rows stored directly on it, e.g., Shard A counts 2 'free' rows and Shard B counts 3.
+    // The merge adds up the aggregates in the SELECT list, but not the helper column, so we would sort by Shard A's count (2) instead of the total (5).
+    // We can't sort by an expression with DISTINCT either, as the helper column would change which rows are distinct.
+    let has_unsupported_sort_key = select.sort_clause().iter().any(|sort_by| {
+        order_by::is_computed_sort_key(sort_by.node())
+            && (order_by::contains_aggregate(sort_by.node(), schema)
+                || !select.distinct_clause().is_empty())
+    });
+
+    if has_unsupported_sort_key {
+        return Err(Error::OrderByExpressionUnsupported);
     }
 
     let mut plan = ProjectionRewritePlan::default();
@@ -202,6 +256,7 @@ fn build(
         return Ok(None);
     }
     let sql: Arc<str> = pg_raw_parse::deparse(&*rewritten)?.as_str().into();
+    let plan = (!plan.is_noop()).then(|| Arc::new(plan));
 
     Ok(Some(PostRouteRewrite { sql, plan }))
 }
@@ -209,6 +264,19 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_count_sort_key() {
+        let ast = pg_raw_parse::parse("SELECT value FROM items GROUP BY value ORDER BY count(*)")
+            .unwrap();
+
+        let rewrite_result = build(&ast, &Schema::default(), false);
+
+        assert!(matches!(
+            rewrite_result,
+            Err(Error::OrderByExpressionUnsupported)
+        ));
+    }
 
     #[test]
     fn projection_plan_tracks_helpers() {

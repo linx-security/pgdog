@@ -5,10 +5,13 @@
 
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use tracing::{info, warn};
 
 use super::otel;
-use super::{Clients, ClientsLocked, Listeners, MirrorStatsMetrics, Pools, QueryCache, TwoPc};
+use super::{
+    ClientAuth, Clients, ClientsLocked, Listeners, MirrorStatsMetrics, Pools, QueryCache, TwoPc,
+};
 use crate::util::safe_sleep;
 use crate::{config::config, tasks};
 
@@ -34,6 +37,10 @@ pub(crate) async fn run() {
 
     let shutdown = tasks::shutdown_signal();
 
+    // We set the start time before the first push.
+    // This is necessary as, if we have a counter where the start time is after the end time, GCP rejects it.
+    Lazy::force(&otel::COUNTERS_START_TIME);
+
     loop {
         tokio::select! {
             _ = safe_sleep(interval) => {}
@@ -47,8 +54,9 @@ pub(crate) async fn run() {
         let listeners = Listeners::load();
         let query_cache = QueryCache::load().metrics();
         let two_pc = TwoPc::load();
+        let client_auth = ClientAuth::load();
 
-        let mut all: Vec<&super::Metric> = vec![&clients, &clients_locked, &two_pc];
+        let mut all: Vec<&super::Metric> = vec![&clients, &clients_locked, &two_pc, &client_auth];
         all.extend(pools.iter());
         all.extend(mirror.iter());
         all.extend(listeners.iter());

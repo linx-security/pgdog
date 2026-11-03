@@ -16,7 +16,9 @@ pub(crate) use copy::CopyRow;
 pub(crate) use error::Error;
 pub(crate) use parser::{Ast, Command, DiscardTarget, QueryParser, Route, SetParam};
 
-use crate::frontend::router::parser::{Shard, route::ShardSource};
+use crate::backend::Cluster;
+use crate::frontend::client::Sticky;
+use crate::frontend::router::parser::{Shard, ShardWithPriority, route::ShardSource};
 
 use super::ClientRequest;
 pub(crate) use context::RouterContext;
@@ -51,10 +53,9 @@ impl Router {
 
     /// Route a query to a shard.
     ///
-    /// If the router can't determine the route for the query to take,
-    /// previous route is preserved. This is useful in case the client
-    /// doesn't supply enough information in the buffer, e.g. just issued
-    /// a Describe request to a previously submitted Parse.
+    /// A request without a query, e.g. Describe or Close for a portal,
+    /// goes to the shard set by `pgdog.shard`, `pgdog.sharding_key`
+    /// or `search_path`. Without such a setting, it goes to all shards.
     pub(crate) fn query(&mut self, context: RouterContext) -> Result<&Command, Error> {
         // Don't invoke parser in copy mode until we're done.
         if context.copy_mode {
@@ -95,6 +96,32 @@ impl Router {
         Ok(&self.latest_command)
     }
 
+    pub(crate) fn skip(
+        &mut self,
+        cluster: &Cluster,
+        request: &ClientRequest,
+        sticky: &Sticky,
+    ) -> bool {
+        if cluster.router_needed() || request.ast.is_some() || sticky.role.is_some() {
+            return false;
+        }
+
+        let shard = ShardWithPriority::new_override_parser_disabled(Shard::Direct(0));
+
+        let mut route = if cluster.read_only() {
+            Route::read(shard)
+        } else {
+            Route::write(shard)
+        };
+
+        route.sharded_schema_only = !cluster.sharding_schema().schemas.is_empty()
+            && cluster.sharded_tables().tables().is_empty();
+
+        self.latest_command = Command::Query(route);
+
+        true
+    }
+
     /// Parse CopyData messages and shard them.
     pub(crate) async fn copy_data(
         &mut self,
@@ -108,6 +135,16 @@ impl Router {
                 .map(CopyRow::omnishard)
                 .collect()),
         }
+    }
+
+    /// Forget the shard the transaction was pinned to.
+    ///
+    /// A pin lives for one transaction. `reset` only runs once a server
+    /// connection is released, so a transaction that ends without one (e.g. its
+    /// only statement was `SET LOCAL pgdog.sharding_key`) must drop the pin
+    /// here, or the next transaction inherits it.
+    pub(crate) fn unpin(&mut self) {
+        self.pinned_shard = None;
     }
 
     /// Reset query routing state.

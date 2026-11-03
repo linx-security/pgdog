@@ -1,5 +1,6 @@
 //! Query parser.
 
+pub(crate) mod advisory_lock;
 pub(crate) mod aggregate;
 pub(crate) mod binary;
 pub(crate) mod cache;
@@ -15,6 +16,7 @@ pub(crate) mod error;
 pub(crate) mod explain_trace;
 mod from_clause;
 pub(crate) mod function;
+mod having;
 pub(crate) mod key;
 mod limit;
 pub(crate) mod multi_tenant;
@@ -44,13 +46,14 @@ pub(crate) use distinct::{Distinct, DistinctBy, DistinctColumn};
 pub(crate) use error::Error;
 pub(crate) use from_clause::FromClause;
 use function::Function;
+pub(crate) use having::{CompareOperator, HavingExpr, HavingRewritePlan, HavingValue};
 pub(crate) use key::Key;
 pub(crate) use limit::{Limit, LimitClause};
 pub(crate) use order_by::OrderBy;
 pub(crate) use params::*;
 pub(crate) use query::QueryParser;
 pub(crate) use rewrite::{StatementRewrite, StatementRewriteContext};
-pub(crate) use route::{Route, Shard, ShardWithPriority, ShardsWithPriority};
+pub(crate) use route::{Route, Shard, ShardWithPriority, ShardsWithPriority, TableChange};
 pub(crate) use schema::Schema;
 pub(crate) use sequence::Sequence;
 pub(crate) use statement::{SchemaLookupContext, StatementParser};
